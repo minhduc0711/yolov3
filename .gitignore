@@ -12,14 +12,14 @@
 *.mov
 *.MOV
 *.avi
-*.data
+# *.data
 *.json
 
-*.cfg
-!cfg/yolov3*.cfg
+# *.cfg
+# !cfg/yolov3*.cfg
 
 runs/*
-data/*
+data/corn_train
 !data/samples/zidane.jpg
 !data/samples/bus.jpg
 !data/coco.names
@@ -48,7 +48,7 @@ gcp_test*.sh
 *.onnx
 *.mlmodel
 darknet53.conv.74
-yolov3-tiny.conv.15
+# yolov3-tiny.conv.15
 
 # GitHub Python GitIgnore ----------------------------------------------------------------------------------------------
 # Byte-compiled / optimized / DLL files
