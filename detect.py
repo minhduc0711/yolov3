@@ -125,9 +125,12 @@ def detect(save_img=False):
 
             # Stream results
             if view_img:
+                if im0.shape[0] > 1000:
+                    import imutils
+                    im0 = imutils.resize(im0, height=1000)
                 cv2.imshow(p, im0)
-                if cv2.waitKey(1) == ord('q'):  # q to quit
-                    raise StopIteration
+                cv2.waitKey(0)
+                cv2.destroyAllWindows()
 
             # Save results (image with detections)
             if save_img:

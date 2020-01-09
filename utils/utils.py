@@ -870,7 +870,7 @@ def fitness(x):
 # Plotting functions ---------------------------------------------------------------------------------------------------
 def plot_one_box(x, img, color=None, label=None, line_thickness=None, font_scale=0.25):
     # Plots one bounding box on image img
-    tl = line_thickness or round(0.002 * (img.shape[0] + img.shape[1]) / 2) + 1  # line thickness
+    tl = line_thickness or round(0.001 * (img.shape[0] + img.shape[1]) / 2) + 1  # line thickness
     color = color or [random.randint(0, 255) for _ in range(3)]
     luminance = (0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]) / 255
     if luminance > 0.5:
