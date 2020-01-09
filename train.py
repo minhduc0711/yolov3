@@ -15,14 +15,14 @@ try:  # Mixed precision training https://github.com/NVIDIA/apex
 except:
     mixed_precision = False  # not installed
 
-wdir = 'weights' + os.sep  # weights dir
+wdir = 'backup' + os.sep  # weights dir
 last = wdir + 'last.pt'
 best = wdir + 'best.pt'
 results_file = 'results.txt'
 
 # Hyperparameters (results68: 59.2 mAP@0.5 yolov3-spp-416) https://github.com/ultralytics/yolov3/issues/310
 
-hyp = {'giou': 3.54,  # giou loss gain
+hyp = {'giou': 2.25,  # giou loss gain
        'cls': 37.4,  # cls loss gain
        'cls_pw': 1.0,  # cls BCELoss positive_weight
        'obj': 49.5,  # obj loss gain (*=img_size/320 if img_size != 320)
@@ -34,8 +34,8 @@ hyp = {'giou': 3.54,  # giou loss gain
        'weight_decay': 0.000484,  # optimizer weight decay
        'fl_gamma': 0.5,  # focal loss gamma
        'hsv_h': 0.0138,  # image HSV-Hue augmentation (fraction)
-       'hsv_s': 0.678,  # image HSV-Saturation augmentation (fraction)
-       'hsv_v': 0.36,  # image HSV-Value augmentation (fraction)
+       'hsv_s': 0.05,  # image HSV-Saturation augmentation (fraction)
+       'hsv_v': 0.05,  # image HSV-Value augmentation (fraction)
        'degrees': 1.98,  # image rotation (+/- deg)
        'translate': 0.05,  # image translation (+/- fraction)
        'scale': 0.05,  # image scale (+/- gain)
