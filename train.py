@@ -186,7 +186,8 @@ def train():
                                   rect=opt.rect,  # rectangular training
                                   image_weights=False,
                                   cache_labels=epochs > 10,
-                                  cache_images=opt.cache_images and not opt.prebias)
+                                  cache_images=opt.cache_images and not opt.prebias,
+                                  mosaic=opt.mosaic)
 
     # Dataloader
     batch_size = min(batch_size, len(dataset))
@@ -424,6 +425,7 @@ if __name__ == '__main__':
     parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1 or cpu)')
     parser.add_argument('--adam', action='store_true', help='use adam optimizer')
     parser.add_argument('--var', type=float, help='debug variable')
+    parser.add_argument('--mosaic', action='store_true', help='load mosaic images')
     opt = parser.parse_args()
     opt.weights = last if opt.resume else opt.weights
     print(opt)
