@@ -53,7 +53,7 @@ def train():
     cfg = opt.cfg
     data = opt.data
     img_size = opt.img_size
-    epochs = 1 if opt.prebias else opt.epochs  # 500200 batches at bs 64, 117263 images = 273 epochs
+    epochs = opt.epochs  # 500200 batches at bs 64, 117263 images = 273 epochs
     batch_size = opt.batch_size
     accumulate = opt.accumulate  # effective bs = batch_size * accumulate = 16 * 4 = 64
     weights = opt.weights  # initial training weights
@@ -65,8 +65,8 @@ def train():
     # Initialize
     init_seeds()
     if opt.multi_scale:
-        img_sz_min = 9  # round(img_size / 32 / 1.5)
-        img_sz_max = 21  # round(img_size / 32 * 1.5)
+        img_sz_min = round(img_size / 32 / 1.5)
+        img_sz_max = round(img_size / 32 * 1.5)
         img_size = img_sz_max * 32  # initiate with maximum multi_scale size
         print('Using multi-scale %g - %g' % (img_sz_min * 32, img_size))
 
@@ -136,16 +136,6 @@ def train():
         # possible weights are '*.weights', 'yolov3-tiny.conv.15',  'darknet53.conv.74' etc.
         cutoff = load_darknet_weights(model, weights)
 
-    if opt.prebias:
-        # Update params (bias-only training allows more aggressive settings: i.e. SGD ~0.1 lr0, ~0.9 momentum)
-        for p in optimizer.param_groups:
-            p['lr'] = 0.1  # learning rate
-            if p.get('momentum') is not None:  # for SGD but not Adam
-                p['momentum'] = 0.9
-
-        for name, p in model.named_parameters():
-            p.requires_grad = True if name.endswith('.bias') else False
-
     # Scheduler https://github.com/ultralytics/yolov3/issues/238
     # lf = lambda x: 1 - x / epochs  # linear ramp to zero
     # lf = lambda x: 10 ** (hyp['lrf'] * x / epochs)  # exp ramp
@@ -184,9 +174,8 @@ def train():
                                   augment=True,
                                   hyp=hyp,  # augmentation hyperparameters
                                   rect=opt.rect,  # rectangular training
-                                  image_weights=False,
-                                  cache_labels=epochs > 10,
-                                  cache_images=opt.cache_images and not opt.prebias,
+                                  cache_labels=True,
+                                  cache_images=opt.cache_images,
                                   mosaic=opt.mosaic)
 
     # Dataloader
@@ -199,17 +188,16 @@ def train():
                                              pin_memory=True,
                                              collate_fn=dataset.collate_fn)
 
-    # Test Dataloader
-    if not opt.prebias:
-        testloader = torch.utils.data.DataLoader(LoadImagesAndLabels(test_path, opt.img_size, batch_size * 2,
-                                                                     hyp=hyp,
-                                                                     rect=True,
-                                                                     cache_labels=True,
-                                                                     cache_images=opt.cache_images),
-                                                 batch_size=batch_size * 2,
-                                                 num_workers=nw,
-                                                 pin_memory=True,
-                                                 collate_fn=dataset.collate_fn)
+    # Testloader
+    testloader = torch.utils.data.DataLoader(LoadImagesAndLabels(test_path, opt.img_size, batch_size * 2,
+                                                                 hyp=hyp,
+                                                                 rect=True,
+                                                                 cache_labels=True,
+                                                                 cache_images=opt.cache_images),
+                                             batch_size=batch_size * 2,
+                                             num_workers=nw,
+                                             pin_memory=True,
+                                             collate_fn=dataset.collate_fn)
 
     # Start training
     nb = len(dataloader)
@@ -223,10 +211,25 @@ def train():
     t0 = time.time()
     torch_utils.model_info(model, report='summary')  # 'full' or 'summary'
     print('Using %g dataloader workers' % nw)
-    print('Starting %s for %g epochs...' % ('prebias' if opt.prebias else 'training', epochs))
-    for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+    print('Starting training for %g epochs...' % epochs)
+    for epoch in range(start_epoch - 1 if opt.prebias else start_epoch, epochs):  # epoch ------------------------------
         model.train()
         print(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'targets', 'img_size'))
+
+        # Prebias
+        if opt.prebias:
+            if epoch < 0:  # prebias
+                ps = 0.1, 0.9, False  # prebias settings (lr=0.1, momentum=0.9, requires_grad=False)
+            else:  # normal training
+                ps = hyp['lr0'], hyp['momentum'], True  # normal training settings
+                opt.prebias = False
+
+            for p in optimizer.param_groups:
+                p['lr'] = ps[0]  # learning rate
+                if p.get('momentum') is not None:  # for SGD but not Adam
+                    p['momentum'] = ps[1]
+            for name, p in model.named_parameters():
+                p.requires_grad = True if name.endswith('.bias') else ps[2]
 
         # Update image weights (optional)
         if dataset.image_weights:
@@ -301,13 +304,11 @@ def train():
 
             # end batch ------------------------------------------------------------------------------------------------
 
-        # Update scheduler
-        scheduler.step()
-
         # Process epoch results
         final_epoch = epoch + 1 == epochs
         if opt.prebias:
             print_model_biases(model)
+            continue
         elif not opt.notest or final_epoch:  # Calculate mAP
             is_coco = any([x in data for x in ['coco.data', 'coco2014.data', 'coco2017.data']]) and model.nc == 80
             results, maps = test.test(cfg,
@@ -320,10 +321,13 @@ def train():
                                       save_json=final_epoch and is_coco,
                                       dataloader=testloader)
 
+        # Update scheduler
+        scheduler.step()
+
         # Write epoch results
         with open(results_file, 'a') as f:
             f.write(s + '%10.3g' * 7 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
-        if len(opt.name) and opt.bucket and not opt.prebias:
+        if len(opt.name) and opt.bucket:
             os.system('gsutil cp results.txt gs://%s/results%s.txt' % (opt.bucket, opt.name))
 
         # Write Tensorboard results
@@ -340,7 +344,7 @@ def train():
             best_fitness = fitness
 
         # Save training results
-        save = (not opt.nosave) or (final_epoch and not opt.evolve) or opt.prebias
+        save = (not opt.nosave) or (final_epoch and not opt.evolve)
         if save:
             with open(results_file, 'r') as f:
                 # Create checkpoint
@@ -369,7 +373,7 @@ def train():
 
     # end training
     n = opt.name
-    if len(n) and not opt.prebias:
+    if len(n):
         n = '_' + n if not n.isnumeric() else n
         fresults, flast, fbest = 'results%s.txt' % n, 'last%s.pt' % n, 'best%s.pt' % n
         os.rename('results.txt', fresults)
@@ -380,26 +384,13 @@ def train():
         if opt.bucket:
             os.system('gsutil cp %s %s gs://%s' % (fresults, wdir + flast, opt.bucket))
 
-    plot_results()  # save as results.png
+    if not opt.evolve:
+        plot_results()  # save as results.png
     print('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
     dist.destroy_process_group() if torch.cuda.device_count() > 1 else None
     torch.cuda.empty_cache()
 
     return results
-
-
-def prebias():
-    # trains output bias layers for 1 epoch and creates new backbone
-    if opt.prebias:
-        # opt_0 = opt  # save settings
-        # opt.rect = False  # update settings (if any)
-
-        train()  # train model biases
-        create_backbone(last)  # saved results as backbone.pt
-
-        # opt = opt_0  # reset settings
-        opt.weights = wdir + 'backbone.pt'  # assign backbone
-        opt.prebias = False  # disable prebias
 
 
 if __name__ == '__main__':
@@ -446,7 +437,6 @@ if __name__ == '__main__':
         except:
             pass
 
-        prebias()  # optional
         train()  # train normally
 
     else:  # Evolve hyperparameters (optional)
@@ -459,24 +449,31 @@ if __name__ == '__main__':
             if os.path.exists('evolve.txt'):  # if evolve.txt exists: select best hyps and mutate
                 # Select parent(s)
                 x = np.loadtxt('evolve.txt', ndmin=2)
-                parent = 'weighted'  # parent selection method: 'single' or 'weighted'
+                parent = 'single'  # parent selection method: 'single' or 'weighted'
                 if parent == 'single' or len(x) == 1:
                     x = x[fitness(x).argmax()]
                 elif parent == 'weighted':  # weighted combination
-                    n = min(10, x.shape[0])  # number to merge
+                    n = min(10, len(x))  # number to merge
                     x = x[np.argsort(-fitness(x))][:n]  # top n mutations
                     w = fitness(x) - fitness(x).min()  # weights
-                    x = (x[:n] * w.reshape(n, 1)).sum(0) / w.sum()  # new parent
-                for i, k in enumerate(hyp.keys()):
-                    hyp[k] = x[i + 7]
+                    x = (x * w.reshape(n, 1)).sum(0) / w.sum()  # new parent
 
                 # Mutate
+                mutate_version = 2
                 np.random.seed(int(time.time()))
-                s = np.random.random() * 0.15  # sigma
-                g = [1, 1, 1, 1, 1, 1, 1, 0, .1, 1, 1, 1, 1, 1, 1, 1, 1, 1]  # gains
+                s = 0.2  # 20% sigma
+                g = np.array([1, 1, 1, 1, 1, 1, 1, 0, .1, 1, 0, 1, 1, 1, 1, 1, 1, 1])  # gains
+                ng = len(g)
+                if mutate_version == 1:
+                    s *= np.random.random()  # sigma
+                    v = (np.random.randn(ng) * g * s + 1) ** 2.0  # plt.hist(x.ravel(), 300)
+                else:
+                    v = np.ones(ng)
+                    while all(v == 1):  # mutate untill a change occurs (prevent duplicates)
+                        r = (np.random.random(ng) < 0.1) * np.random.randn(ng)  # 10% mutation probability
+                        v = (g * s * r + 1) ** 2.0  # plt.hist(x.ravel(), 300)
                 for i, k in enumerate(hyp.keys()):
-                    x = (np.random.randn() * s * g[i] + 1) ** 2.0  # plt.hist(x.ravel(), 300)
-                    hyp[k] *= float(x)  # vary by sigmas
+                    hyp[k] = x[i + 7] * v[i]  # mutate
 
             # Clip to limits
             keys = ['lr0', 'iou_t', 'momentum', 'weight_decay', 'hsv_s', 'hsv_v', 'translate', 'scale', 'fl_gamma']
@@ -485,7 +482,6 @@ if __name__ == '__main__':
                 hyp[k] = np.clip(hyp[k], v[0], v[1])
 
             # Train mutation
-            prebias()
             results = train()
 
             # Write mutation results

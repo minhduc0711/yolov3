@@ -49,7 +49,7 @@ def test(cfg,
     path = data['valid']  # path to test images
     names = load_classes(data['names'])  # class names
     iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
-    iouv = iouv[0].view(1)  # for mAP@0.5
+    iouv = iouv[0].view(1)  # comment for mAP@0.5:0.95
     niou = iouv.numel()
 
     # Dataloader
@@ -155,7 +155,7 @@ def test(cfg,
             stats.append((correct, pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
 
     # Compute statistics
-    stats = [np.concatenate(x, 0) for x in list(zip(*stats))]  # to numpy
+    stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
     if len(stats):
         p, r, ap, f1, ap_class = ap_per_class(*stats)
         if niou > 1:

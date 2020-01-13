@@ -284,7 +284,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
         # Rectangular Training  https://github.com/ultralytics/yolov3/issues/232
         if self.rect:
-            # Read image shapes
+            # Read image shapes (wh)
             sp = path.replace('.txt', '.shapes')  # shapefile path
             try:
                 with open(sp, 'r') as f:  # read existing shapefile
@@ -300,7 +300,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             i = ar.argsort()
             self.img_files = [self.img_files[i] for i in i]
             self.label_files = [self.label_files[i] for i in i]
-            self.shapes = s[i]
+            self.shapes = s[i]  # wh
             ar = ar[i]
 
             # Set training image shapes
@@ -380,12 +380,13 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     nf, nm, ne, nd, n)
             assert nf > 0, 'No labels found. See %s' % help_url
 
-        # Cache images into memory for faster training (WARNING: Large datasets may exceed system RAM)
+        # Cache images into memory for faster training (WARNING: large datasets may exceed system RAM)
         if cache_images:  # if training
             gb = 0  # Gigabytes of cached images
             pbar = tqdm(range(len(self.img_files)), desc='Caching images')
+            self.img_hw0, self.img_hw = [None] * n, [None] * n
             for i in pbar:  # max 10k images
-                self.imgs[i] = load_image(self, i)
+                self.imgs[i], self.img_hw0[i], self.img_hw[i] = load_image(self, i)  # img, hw_original, hw_resized
                 gb += self.imgs[i].nbytes
                 pbar.desc = 'Caching images (%.1fGB)' % (gb / 1E9)
 
@@ -420,17 +421,16 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         if self.mosaic:
             # Load mosaic
             img, labels = load_mosaic(self, index)
-            h, w = img.shape[:2]
-            ratio, pad = None, None
+            shapes = None
 
         else:
             # Load image
-            img = load_image(self, index)
+            img, (h0, w0), (h, w) = load_image(self, index)
 
             # Letterbox
-            h, w = img.shape[:2]
             shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
             img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
+            shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
 
             # Load labels
             labels = []
@@ -496,28 +496,31 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
         img = np.ascontiguousarray(img)
 
-        return torch.from_numpy(img), labels_out, img_path, ((h, w), (ratio, pad))
+        return torch.from_numpy(img), labels_out, img_path, shapes
 
     @staticmethod
     def collate_fn(batch):
-        img, label, path, shapes = list(zip(*batch))  # transposed
+        img, label, path, shapes = zip(*batch)  # transposed
         for i, l in enumerate(label):
             l[:, 0] = i  # add target image index for build_targets()
         return torch.stack(img, 0), torch.cat(label, 0), path, shapes
 
 
 def load_image(self, index):
-    # loads 1 image from dataset
+    # loads 1 image from dataset, returns img, original hw, resized hw
     img = self.imgs[index]
-    if img is None:
+    if img is None:  # not cached
         img_path = self.img_files[index]
         img = cv2.imread(img_path)  # BGR
         assert img is not None, 'Image Not Found ' + img_path
-        r = self.img_size / max(img.shape)  # resize image to img_size
-        if self.augment and (r != 1):  # always resize down, only resize up if training with augmentation
-            h, w = img.shape[:2]
-            return cv2.resize(img, (int(w * r), int(h * r)), interpolation=cv2.INTER_LINEAR)  # _LINEAR fastest
-    return img
+        h0, w0 = img.shape[:2]  # orig hw
+        r = self.img_size / max(h0, w0)  # resize image to img_size
+        if r < 1 or (self.augment and (r != 1)):  # always resize down, only resize up if training with augmentation
+            interp = cv2.INTER_LINEAR if self.augment else cv2.INTER_AREA  # LINEAR for training, AREA for testing
+            img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
+        return img, (h0, w0), img.shape[:2]  # img, hw_original, hw_resized
+    else:
+        return self.imgs[index], self.img_hw0[index], self.img_hw[index]  # img, hw_original, hw_resized
 
 
 def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
@@ -536,8 +539,7 @@ def load_mosaic(self, index):
     indices = [index] + [random.randint(0, len(self.labels) - 1) for _ in range(3)]  # 3 additional image indices
     for i, index in enumerate(indices):
         # Load image
-        img = load_image(self, index)
-        h, w, _ = img.shape
+        img, _, (h, w) = load_image(self, index)
 
         # place img in img4
         if i == 0:  # top left
