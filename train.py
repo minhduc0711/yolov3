@@ -20,7 +20,7 @@ last = wdir + 'last.pt'
 best = wdir + 'best.pt'
 results_file = 'results.txt'
 
-# Hyperparameters (results68: 59.2 mAP@0.5 yolov3-spp-416) https://github.com/ultralytics/yolov3/issues/310
+# Hyperparameters (results68: 59.9 mAP@0.5 yolov3-spp-416) https://github.com/ultralytics/yolov3/issues/310
 
 hyp = {'giou': 2.25,  # giou loss gain
        'cls': 37.4,  # cls loss gain
@@ -28,7 +28,7 @@ hyp = {'giou': 2.25,  # giou loss gain
        'obj': 49.5,  # obj loss gain (*=img_size/320 if img_size != 320)
        'obj_pw': 1.0,  # obj BCELoss positive_weight
        'iou_t': 0.225,  # iou training threshold
-       'lr0': 0.00579,  # initial learning rate (SGD=1E-3, Adam=9E-5)
+       'lr0': 0.00579,  # initial learning rate (SGD=5E-3, Adam=5E-4)
        'lrf': -4.,  # final LambdaLR learning rate = lr0 * (10 ** lrf)
        'momentum': 0.937,  # SGD momentum
        'weight_decay': 0.000484,  # optimizer weight decay
@@ -52,15 +52,11 @@ if f:
 def train():
     cfg = opt.cfg
     data = opt.data
-    img_size = opt.img_size
+    img_size, img_size_test = opt.img_size if len(opt.img_size) == 2 else opt.img_size * 2  # train, test sizes
     epochs = opt.epochs  # 500200 batches at bs 64, 117263 images = 273 epochs
     batch_size = opt.batch_size
     accumulate = opt.accumulate  # effective bs = batch_size * accumulate = 16 * 4 = 64
     weights = opt.weights  # initial training weights
-
-    if 'pw' not in opt.arc:  # remove BCELoss positive weights
-        hyp['cls_pw'] = 1.
-        hyp['obj_pw'] = 1.
 
     # Initialize
     init_seeds()
@@ -74,37 +70,40 @@ def train():
     data_dict = parse_data_cfg(data)
     train_path = data_dict['train']
     test_path = data_dict['valid']
-    nc = int(data_dict['classes'])  # number of classes
+    nc = 1 if opt.single_cls else int(data_dict['classes'])  # number of classes
 
     # Remove previous results
-    for f in glob.glob('*_batch*.jpg') + glob.glob(results_file):
+    for f in glob.glob('*_batch*.png') + glob.glob(results_file):
         os.remove(f)
 
     # Initialize model
     model = Darknet(cfg, arc=opt.arc).to(device)
 
     # Optimizer
-    pg0, pg1 = [], []  # optimizer parameter groups
+    pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
     for k, v in dict(model.named_parameters()).items():
-        if 'Conv2d.weight' in k:
-            pg1 += [v]  # parameter group 1 (apply weight_decay)
+        if '.bias' in k:
+            pg2 += [v]  # biases
+        elif 'Conv2d.weight' in k:
+            pg1 += [v]  # apply weight_decay
         else:
-            pg0 += [v]  # parameter group 0
+            pg0 += [v]  # all else
 
     if opt.adam:
+        # hyp['lr0'] *= 0.1  # reduce lr (i.e. SGD=5E-3, Adam=5E-4)
         optimizer = optim.Adam(pg0, lr=hyp['lr0'])
         # optimizer = AdaBound(pg0, lr=hyp['lr0'], final_lr=0.1)
     else:
         optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
     optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
-    del pg0, pg1
+    optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
+    del pg0, pg1, pg2
 
     # https://github.com/alphadl/lookahead.pytorch
     # optimizer = torch_utils.Lookahead(optimizer, k=5, alpha=0.5)
 
-    cutoff = -1  # backbone reaches to cutoff layer
     start_epoch = 0
-    best_fitness = float('inf')
+    best_fitness = 0.0
     attempt_download(weights)
     if weights.endswith('.pt'):  # pytorch format
         # possible weights are '*.pt', 'yolov3-spp.pt', 'yolov3-tiny.pt' etc.
@@ -134,7 +133,7 @@ def train():
 
     elif len(weights) > 0:  # darknet format
         # possible weights are '*.weights', 'yolov3-tiny.conv.15',  'darknet53.conv.74' etc.
-        cutoff = load_darknet_weights(model, weights)
+        load_darknet_weights(model, weights)
 
     # Scheduler https://github.com/ultralytics/yolov3/issues/238
     # lf = lambda x: 1 - x / epochs  # linear ramp to zero
@@ -176,6 +175,7 @@ def train():
                                   rect=opt.rect,  # rectangular training
                                   cache_labels=True,
                                   cache_images=opt.cache_images,
+                                  single_cls=opt.single_cls,
                                   mosaic=opt.mosaic)
 
     # Dataloader
@@ -189,11 +189,12 @@ def train():
                                              collate_fn=dataset.collate_fn)
 
     # Testloader
-    testloader = torch.utils.data.DataLoader(LoadImagesAndLabels(test_path, opt.img_size, batch_size * 2,
+    testloader = torch.utils.data.DataLoader(LoadImagesAndLabels(test_path, img_size_test, batch_size * 2,
                                                                  hyp=hyp,
                                                                  rect=True,
                                                                  cache_labels=True,
-                                                                 cache_images=opt.cache_images),
+                                                                 cache_images=opt.cache_images,
+                                                                 single_cls=opt.single_cls),
                                              batch_size=batch_size * 2,
                                              num_workers=nw,
                                              pin_memory=True,
@@ -201,6 +202,7 @@ def train():
 
     # Start training
     nb = len(dataloader)
+    prebias = start_epoch == 0
     model.nc = nc  # attach number of classes to model
     model.arc = opt.arc  # attach yolo architecture
     model.hyp = hyp  # attach hyperparameters to model
@@ -212,24 +214,22 @@ def train():
     torch_utils.model_info(model, report='summary')  # 'full' or 'summary'
     print('Using %g dataloader workers' % nw)
     print('Starting training for %g epochs...' % epochs)
-    for epoch in range(start_epoch - 1 if opt.prebias else start_epoch, epochs):  # epoch ------------------------------
+    for epoch in range(start_epoch, epochs):  # epoch ------------------------------
         model.train()
-        print(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'targets', 'img_size'))
 
         # Prebias
-        if opt.prebias:
-            if epoch < 0:  # prebias
-                ps = 0.1, 0.9, False  # prebias settings (lr=0.1, momentum=0.9, requires_grad=False)
+        if prebias:
+            if epoch < 3:  # prebias
+                ps = 0.1, 0.9  # prebias settings (lr=0.1, momentum=0.9)
             else:  # normal training
-                ps = hyp['lr0'], hyp['momentum'], True  # normal training settings
-                opt.prebias = False
+                ps = hyp['lr0'], hyp['momentum']  # normal training settings
+                print_model_biases(model)
+                prebias = False
 
-            for p in optimizer.param_groups:
-                p['lr'] = ps[0]  # learning rate
-                if p.get('momentum') is not None:  # for SGD but not Adam
-                    p['momentum'] = ps[1]
-            for name, p in model.named_parameters():
-                p.requires_grad = True if name.endswith('.bias') else ps[2]
+            # Bias optimizer settings
+            optimizer.param_groups[2]['lr'] = ps[0]
+            if optimizer.param_groups[2].get('momentum') is not None:  # for SGD but not Adam
+                optimizer.param_groups[2]['momentum'] = ps[1]
 
         # Update image weights (optional)
         if dataset.image_weights:
@@ -238,27 +238,12 @@ def train():
             dataset.indices = random.choices(range(dataset.n), weights=image_weights, k=dataset.n)  # rand weighted idx
 
         mloss = torch.zeros(4).to(device)  # mean losses
+        print(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'targets', 'img_size'))
         pbar = tqdm(enumerate(dataloader), total=nb)  # progress bar
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
             targets = targets.to(device)
-
-            # Multi-Scale training
-            if opt.multi_scale:
-                if ni / accumulate % 10 == 0:  #  adjust (67% - 150%) every 10 batches
-                    img_size = random.randrange(img_sz_min, img_sz_max + 1) * 32
-                sf = img_size / max(imgs.shape[2:])  # scale factor
-                if sf != 1:
-                    ns = [math.ceil(x * sf / 32.) * 32 for x in imgs.shape[2:]]  # new shape (stretched to 32-multiple)
-                    imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
-
-            # Plot images with bounding boxes
-            if ni == 0:
-                fname = 'train_batch%g.jpg' % i
-                plot_images(imgs=imgs, targets=targets, paths=paths, fname=fname)
-                if tb_writer:
-                    tb_writer.add_image(fname, cv2.imread(fname)[:, :, ::-1], dataformats='HWC')
 
             # Hyperparameter burn-in
             # n_burn = nb - 1  # min(nb // 5 + 1, 1000)  # number of burn-in batches
@@ -271,11 +256,27 @@ def train():
             #         x['lr'] = hyp['lr0'] * g
             #         x['weight_decay'] = hyp['weight_decay'] * g
 
+            # Plot images with bounding boxes
+            if ni == 0:
+                fname = 'train_batch%g.png' % i
+                plot_images(imgs=imgs, targets=targets, paths=paths, fname=fname)
+                if tb_writer:
+                    tb_writer.add_image(fname, cv2.imread(fname)[:, :, ::-1], dataformats='HWC')
+
+            # Multi-Scale training
+            if opt.multi_scale:
+                if ni / accumulate % 10 == 0:  #  adjust (67% - 150%) every 10 batches
+                    img_size = random.randrange(img_sz_min, img_sz_max + 1) * 32
+                sf = img_size / max(imgs.shape[2:])  # scale factor
+                if sf != 1:
+                    ns = [math.ceil(x * sf / 32.) * 32 for x in imgs.shape[2:]]  # new shape (stretched to 32-multiple)
+                    imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
+
             # Run model
             pred = model(imgs)
 
             # Compute loss
-            loss, loss_items = compute_loss(pred, targets, model)
+            loss, loss_items = compute_loss(pred, targets, model, not prebias)
             if not torch.isfinite(loss):
                 print('WARNING: non-finite loss, ending training ', loss_items)
                 return results
@@ -297,28 +298,25 @@ def train():
 
             # Print batch results
             mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
-            mem = torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0  # (GB)
-            s = ('%10s' * 2 + '%10.3g' * 6) % (
-                '%g/%g' % (epoch, epochs - 1), '%.3gG' % mem, *mloss, len(targets), img_size)
+            mem = '%.3gG' % (torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
+            s = ('%10s' * 2 + '%10.3g' * 6) % ('%g/%g' % (epoch, epochs - 1), mem, *mloss, len(targets), img_size)
             pbar.set_description(s)
 
             # end batch ------------------------------------------------------------------------------------------------
 
         # Process epoch results
         final_epoch = epoch + 1 == epochs
-        if opt.prebias:
-            print_model_biases(model)
-            continue
-        elif not opt.notest or final_epoch:  # Calculate mAP
+        if not opt.notest or final_epoch:  # Calculate mAP
             is_coco = any([x in data for x in ['coco.data', 'coco2014.data', 'coco2017.data']]) and model.nc == 80
             results, maps = test.test(cfg,
                                       data,
                                       batch_size=batch_size * 2,
-                                      img_size=opt.img_size,
+                                      img_size=img_size_test,
                                       model=model,
-                                      conf_thres=0.001 if final_epoch else 0.1,  # 0.1 for speed
-                                      iou_thres=0.6 if final_epoch and is_coco else 0.5,
+                                      conf_thres=1E-3 if opt.evolve or (final_epoch and is_coco) else 0.1,  # 0.1 faster
+                                      iou_thres=0.6,
                                       save_json=final_epoch and is_coco,
+                                      single_cls=opt.single_cls,
                                       dataloader=testloader)
 
         # Update scheduler
@@ -328,7 +326,7 @@ def train():
         with open(results_file, 'a') as f:
             f.write(s + '%10.3g' * 7 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
         if len(opt.name) and opt.bucket:
-            os.system('gsutil cp results.txt gs://%s/results%s.txt' % (opt.bucket, opt.name))
+            os.system('gsutil cp results.txt gs://%s/results/results%s.txt' % (opt.bucket, opt.name))
 
         # Write Tensorboard results
         if tb_writer:
@@ -339,9 +337,9 @@ def train():
                 tb_writer.add_scalar(title, xi, epoch)
 
         # Update best mAP
-        fitness = sum(results[4:])  # total loss
-        if fitness < best_fitness:
-            best_fitness = fitness
+        fi = fitness(np.array(results).reshape(1, -1))  # fitness_i = weighted combination of [P, R, mAP, F1]
+        if fi > best_fitness:
+            best_fitness = fi
 
         # Save training results
         save = (not opt.nosave) or (final_epoch and not opt.evolve)
@@ -359,12 +357,12 @@ def train():
             torch.save(chkpt, last)
 
             # Save best checkpoint
-            if best_fitness == fitness:
+            if best_fitness == fi:
                 torch.save(chkpt, best)
 
             # Save backup every 10 epochs (optional)
-            if epoch > 0 and epoch % 10 == 0:
-                torch.save(chkpt, wdir + 'backup%g.pt' % epoch)
+            # if epoch > 0 and epoch % 10 == 0:
+            #     torch.save(chkpt, wdir + 'backup%g.pt' % epoch)
 
             # Delete checkpoint
             del chkpt
@@ -379,10 +377,10 @@ def train():
         os.rename('results.txt', fresults)
         os.rename(wdir + 'last.pt', wdir + flast) if os.path.exists(wdir + 'last.pt') else None
         os.rename(wdir + 'best.pt', wdir + fbest) if os.path.exists(wdir + 'best.pt') else None
-
-        # save to cloud
-        if opt.bucket:
-            os.system('gsutil cp %s %s gs://%s' % (fresults, wdir + flast, opt.bucket))
+        if opt.bucket:  # save to cloud
+            os.system('gsutil cp %s gs://%s/results' % (fresults, opt.bucket))
+            os.system('gsutil cp %s gs://%s/weights' % (wdir + flast, opt.bucket))
+            # os.system('gsutil cp %s gs://%s/weights' % (wdir + fbest, opt.bucket))
 
     if not opt.evolve:
         plot_results()  # save as results.png
@@ -401,7 +399,7 @@ if __name__ == '__main__':
     parser.add_argument('--cfg', type=str, default='cfg/yolov3-spp.cfg', help='*.cfg path')
     parser.add_argument('--data', type=str, default='data/coco2017.data', help='*.data path')
     parser.add_argument('--multi-scale', action='store_true', help='adjust (67% - 150%) img_size every 10 batches')
-    parser.add_argument('--img-size', type=int, default=416, help='inference size (pixels)')
+    parser.add_argument('--img-size', nargs='+', type=int, default=[416], help='train and test image-sizes')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--resume', action='store_true', help='resume training from last.pt')
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
@@ -410,11 +408,11 @@ if __name__ == '__main__':
     parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
     parser.add_argument('--cache-images', action='store_true', help='cache images for faster training')
     parser.add_argument('--weights', type=str, default='weights/ultralytics68.pt', help='initial weights')
-    parser.add_argument('--arc', type=str, default='default', help='yolo architecture')  # defaultpw, uCE, uBCE
-    parser.add_argument('--prebias', action='store_true', help='pretrain model biases')
+    parser.add_argument('--arc', type=str, default='default', help='yolo architecture')  # default, uCE, uBCE
     parser.add_argument('--name', default='', help='renames results.txt to results_name.txt if supplied')
     parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1 or cpu)')
     parser.add_argument('--adam', action='store_true', help='use adam optimizer')
+    parser.add_argument('--single-cls', action='store_true', help='train as single-class dataset')
     parser.add_argument('--var', type=float, help='debug variable')
     parser.add_argument('--mosaic', action='store_true', help='load mosaic images')
     opt = parser.parse_args()
@@ -425,7 +423,7 @@ if __name__ == '__main__':
         mixed_precision = False
 
     # scale hyp['obj'] by img_size (evolved at 320)
-    # hyp['obj'] *= opt.img_size / 320.
+    # hyp['obj'] *= opt.img_size[0] / 320.
 
     tb_writer = None
     if not opt.evolve:  # Train normally
@@ -440,39 +438,40 @@ if __name__ == '__main__':
         train()  # train normally
 
     else:  # Evolve hyperparameters (optional)
-        opt.notest = True  # only test final epoch
-        opt.nosave = True  # only save final checkpoint
+        opt.notest, opt.nosave = True, True  # only test/save final epoch
         if opt.bucket:
             os.system('gsutil cp gs://%s/evolve.txt .' % opt.bucket)  # download evolve.txt if exists
 
         for _ in range(1):  # generations to evolve
             if os.path.exists('evolve.txt'):  # if evolve.txt exists: select best hyps and mutate
                 # Select parent(s)
-                x = np.loadtxt('evolve.txt', ndmin=2)
                 parent = 'single'  # parent selection method: 'single' or 'weighted'
+                x = np.loadtxt('evolve.txt', ndmin=2)
+                n = min(5, len(x))  # number of previous results to consider
+                x = x[np.argsort(-fitness(x))][:n]  # top n mutations
+                w = fitness(x) - fitness(x).min()  # weights
                 if parent == 'single' or len(x) == 1:
-                    x = x[fitness(x).argmax()]
-                elif parent == 'weighted':  # weighted combination
-                    n = min(10, len(x))  # number to merge
-                    x = x[np.argsort(-fitness(x))][:n]  # top n mutations
-                    w = fitness(x) - fitness(x).min()  # weights
-                    x = (x * w.reshape(n, 1)).sum(0) / w.sum()  # new parent
+                    # x = x[random.randint(0, n - 1)]  # random selection
+                    x = x[random.choices(range(n), weights=w)[0]]  # weighted selection
+                elif parent == 'weighted':
+                    x = (x * w.reshape(n, 1)).sum(0) / w.sum()  # weighted combination
 
                 # Mutate
-                mutate_version = 2
-                np.random.seed(int(time.time()))
-                s = 0.2  # 20% sigma
+                method, mp, s = 3, 0.9, 0.2  # method, mutation probability, sigma
+                npr = np.random
+                npr.seed(int(time.time()))
                 g = np.array([1, 1, 1, 1, 1, 1, 1, 0, .1, 1, 0, 1, 1, 1, 1, 1, 1, 1])  # gains
                 ng = len(g)
-                if mutate_version == 1:
-                    s *= np.random.random()  # sigma
-                    v = (np.random.randn(ng) * g * s + 1) ** 2.0  # plt.hist(x.ravel(), 300)
-                else:
+                if method == 1:
+                    v = (npr.randn(ng) * npr.random() * g * s + 1) ** 2.0
+                elif method == 2:
+                    v = (npr.randn(ng) * npr.random(ng) * g * s + 1) ** 2.0
+                elif method == 3:
                     v = np.ones(ng)
-                    while all(v == 1):  # mutate untill a change occurs (prevent duplicates)
-                        r = (np.random.random(ng) < 0.1) * np.random.randn(ng)  # 10% mutation probability
-                        v = (g * s * r + 1) ** 2.0  # plt.hist(x.ravel(), 300)
-                for i, k in enumerate(hyp.keys()):
+                    while all(v == 1):  # mutate until a change occurs (prevent duplicates)
+                        # v = (g * (npr.random(ng) < mp) * npr.randn(ng) * s + 1) ** 2.0
+                        v = (g * (npr.random(ng) < mp) * npr.randn(ng) * npr.random() * s + 1).clip(0.3, 3.0)
+                for i, k in enumerate(hyp.keys()):  # plt.hist(v.ravel(), 300)
                     hyp[k] = x[i + 7] * v[i]  # mutate
 
             # Clip to limits

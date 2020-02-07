@@ -215,6 +215,12 @@ class LoadStreams:  # multiple IP or RTSP cameras
             thread.start()
         print('')  # newline
 
+        # check for common shapes
+        s = np.stack([letterbox(x, new_shape=self.img_size)[0].shape for x in self.imgs], 0)  # inference shapes
+        self.rect = np.unique(s, axis=0).shape[0] == 1  # rect inference if all shapes equal
+        if not self.rect:
+            print('WARNING: Different stream shapes detected. For optimal performance supply similarly-shaped streams.')
+
     def update(self, index, cap):
         # Read next stream frame in a daemon thread
         n = 0
@@ -239,7 +245,7 @@ class LoadStreams:  # multiple IP or RTSP cameras
             raise StopIteration
 
         # Letterbox
-        img = [letterbox(x, new_shape=self.img_size, interp=cv2.INTER_LINEAR)[0] for x in img0]
+        img = [letterbox(x, new_shape=self.img_size, auto=self.rect, interp=cv2.INTER_LINEAR)[0] for x in img0]
 
         # Stack
         img = np.stack(img, 0)
@@ -257,7 +263,7 @@ class LoadStreams:  # multiple IP or RTSP cameras
 
 class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=416, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
-                 cache_labels=False, cache_images=False, mosaic=False):
+                 cache_labels=False, cache_images=False, single_cls=False, mosaic=False):
         path = str(Path(path))  # os-agnostic
         assert os.path.isfile(path), 'File not found %s. See %s' % (path, help_url)
         with open(path, 'r') as f:
@@ -338,7 +344,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s' % file
                     if np.unique(l, axis=0).shape[0] < l.shape[0]:  # duplicate rows
                         nd += 1  # print('WARNING: duplicate rows in %s' % self.label_files[i])  # duplicate rows
-
+                    if single_cls:
+                        l[:, 0] = 0  # force dataset into single-class mode
                     self.labels[i] = l
                     nf += 1  # file found
 
@@ -364,7 +371,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                             if not os.path.exists(Path(f).parent):
                                 os.makedirs(Path(f).parent)  # make new output folder
 
-                            b = x[1:] * np.array([w, h, w, h])  # box
+                            b = x[1:] * [w, h, w, h]  # box
                             b[2:] = b[2:].max()  # rectangle to square
                             b[2:] = b[2:] * 1.3 + 30  # pad
                             b = xywh2xyxy(b.reshape(-1, 4)).ravel().astype(np.int)
@@ -587,10 +594,10 @@ def load_mosaic(self, index):
     # Augment
     # img4 = img4[s // 2: int(s * 1.5), s // 2:int(s * 1.5)]  # center crop (WARNING, requires box pruning)
     img4, labels4 = random_affine(img4, labels4,
-                                  degrees=self.hyp['degrees'] * 0,
-                                  translate=self.hyp['translate'] * 0,
-                                  scale=self.hyp['scale'] * 0,
-                                  shear=self.hyp['shear'] * 0,
+                                  degrees=self.hyp['degrees'] * 1,
+                                  translate=self.hyp['translate'] * 1,
+                                  scale=self.hyp['scale'] * 1,
+                                  shear=self.hyp['shear'] * 1,
                                   border=-s // 2)  # border to remove
 
     return img4, labels4
@@ -725,7 +732,7 @@ def cutout(image, labels):
         return inter_area / box2_area
 
     # create random masks
-    scales = [0.5] * 1  # + [0.25] * 4 + [0.125] * 16 + [0.0625] * 64 + [0.03125] * 256  # image size fraction
+    scales = [0.5] * 1 + [0.25] * 2 + [0.125] * 4 + [0.0625] * 8 + [0.03125] * 16  # image size fraction
     for s in scales:
         mask_h = random.randint(1, int(h * s))
         mask_w = random.randint(1, int(w * s))
@@ -737,14 +744,13 @@ def cutout(image, labels):
         ymax = min(h, ymin + mask_h)
 
         # apply random color mask
-        mask_color = [random.randint(0, 255) for _ in range(3)]
-        image[ymin:ymax, xmin:xmax] = mask_color
+        image[ymin:ymax, xmin:xmax] = [random.randint(64, 191) for _ in range(3)]
 
         # return unobscured labels
         if len(labels) and s > 0.03:
             box = np.array([xmin, ymin, xmax, ymax], dtype=np.float32)
             ioa = bbox_ioa(box, labels[:, 1:5])  # intersection over area
-            labels = labels[ioa < 0.90]  # remove >90% obscured labels
+            labels = labels[ioa < 0.60]  # remove >60% obscured labels
 
     return labels
 

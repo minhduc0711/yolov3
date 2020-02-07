@@ -216,9 +216,11 @@ def ap_per_class(tp, conf, pred_cls, target_cls):
 
             # Plot
             # fig, ax = plt.subplots(1, 1, figsize=(4, 4))
-            # ax.plot(np.concatenate(([0.], recall)), np.concatenate(([0.], precision)))
-            # ax.set_title('YOLOv3-SPP'); ax.set_xlabel('Recall'); ax.set_ylabel('Precision')
-            # ax.set_xlim(0, 1)
+            # ax.plot(recall, precision)
+            # ax.set_xlabel('Recall')
+            # ax.set_ylabel('Precision')
+            # ax.set_xlim(0, 1.01)
+            # ax.set_ylim(0, 1.01)
             # fig.tight_layout()
             # fig.savefig('PR_curve.png', dpi=300)
 
@@ -341,13 +343,13 @@ def wh_iou(wh1, wh2):
 class FocalLoss(nn.Module):
     # Wraps focal loss around existing loss_fcn() https://arxiv.org/pdf/1708.02002.pdf
     # i.e. criteria = FocalLoss(nn.BCEWithLogitsLoss(), gamma=2.5)
-    def __init__(self, loss_fcn, gamma=0.5, alpha=1, reduction='mean'):
+    def __init__(self, loss_fcn, gamma=0.5, alpha=1):
         super(FocalLoss, self).__init__()
-        loss_fcn.reduction = 'none'  # required to apply FL to each element
         self.loss_fcn = loss_fcn
         self.gamma = gamma
         self.alpha = alpha
-        self.reduction = reduction
+        self.reduction = loss_fcn.reduction
+        self.loss_fcn.reduction = 'none'  # required to apply FL to each element
 
     def forward(self, input, target):
         loss = self.loss_fcn(input, target)
@@ -361,7 +363,7 @@ class FocalLoss(nn.Module):
             return loss
 
 
-def compute_loss(p, targets, model):  # predictions, targets, model
+def compute_loss(p, targets, model, giou_flag=True):  # predictions, targets, model
     ft = torch.cuda.FloatTensor if p[0].is_cuda else torch.Tensor
     lcls, lbox, lobj = ft([0]), ft([0]), ft([0])
     tcls, tbox, indices, anchor_vec = build_targets(model, targets)
@@ -399,7 +401,7 @@ def compute_loss(p, targets, model):  # predictions, targets, model
             pbox = torch.cat((pxy, pwh), 1)  # predicted box
             giou = bbox_iou(pbox.t(), tbox[i], x1y1x2y2=False, GIoU=True)  # giou computation
             lbox += (1.0 - giou).sum() if red == 'sum' else (1.0 - giou).mean()  # giou loss
-            tobj[b, a, gj, gi] = giou.detach().type(tobj.dtype)
+            tobj[b, a, gj, gi] = giou.detach().type(tobj.dtype) if giou_flag else 1.0
 
             if 'default' in arc and model.nc > 1:  # cls loss (only if multiple classes)
                 t = torch.zeros_like(ps[:, 5:])  # targets
@@ -512,6 +514,8 @@ def non_max_suppression(prediction, conf_thres=0.5, iou_thres=0.5, multi_cls=Tru
     min_wh, max_wh = 2, 4096  # (pixels) minimum and maximum box width and height
 
     method = 'vision_batch'
+    nc = prediction[0].shape[1] - 5  # number of classes
+    multi_cls = multi_cls and (nc > 1)  # allow multiple classes per anchor
     output = [None] * len(prediction)
     for image_i, pred in enumerate(prediction):
         # Apply conf constraint
@@ -525,7 +529,6 @@ def non_max_suppression(prediction, conf_thres=0.5, iou_thres=0.5, multi_cls=Tru
             continue
 
         # Compute conf
-        torch.sigmoid_(pred[..., 5:])
         pred[..., 5:] *= pred[..., 4:5]  # conf = obj_conf * cls_conf
 
         # Box (center x, center y, width, height) to (x1, y1, x2, y2)
@@ -633,7 +636,7 @@ def get_yolo_layers(model):
 
 def print_model_biases(model):
     # prints the bias neurons preceding each yolo layer
-    print('\nModel Bias Summary:')
+    print('\nModel Bias Summary: %8s%18s%18s%18s' % ('layer', 'regression', 'objectness', 'classification'))
     multi_gpu = type(model) in (nn.parallel.DataParallel, nn.parallel.DistributedDataParallel)
     for l in model.yolo_layers:  # print pretrained biases
         if multi_gpu:
@@ -642,9 +645,9 @@ def print_model_biases(model):
         else:
             na = model.module_list[l].na
             b = model.module_list[l - 1][0].bias.view(na, -1)  # bias 3x85
-        print('layer %3g regression: %5.2f+/-%-5.2f ' % (l, b[:, :4].mean(), b[:, :4].std()),
-              'objectness: %5.2f+/-%-5.2f ' % (b[:, 4].mean(), b[:, 4].std()),
-              'classification: %5.2f+/-%-5.2f' % (b[:, 5:].mean(), b[:, 5:].std()))
+        print(' ' * 20 + '%8g %18s%18s%18s' % (l, '%5.2f+/-%-5.2f' % (b[:, :4].mean(), b[:, :4].std()),
+                                               '%5.2f+/-%-5.2f' % (b[:, 4].mean(), b[:, 4].std()),
+                                               '%5.2f+/-%-5.2f' % (b[:, 5:].mean(), b[:, 5:].std())))
 
 
 def strip_optimizer(f='weights/last.pt'):  # from utils.utils import *; strip_optimizer()
@@ -742,28 +745,28 @@ def coco_single_class_labels(path='../coco/labels/train2014/', label_class=43):
             shutil.copyfile(src=img_file, dst='new/images/' + Path(file).name.replace('txt', 'jpg'))  # copy images
 
 
-def kmean_anchors(path='../coco/train2017.txt', n=9, img_size=(320, 640)):
+def kmean_anchors(path='../coco/train2017.txt', n=9, img_size=(608, 608)):
     # from utils.utils import *; _ = kmean_anchors()
     # Produces a list of target kmeans suitable for use in *.cfg files
     from utils.datasets import LoadImagesAndLabels
     thr = 0.20  # IoU threshold
 
-    def print_results(thr, wh, k):
+    def print_results(k):
         k = k[np.argsort(k.prod(1))]  # sort small to large
-        iou = wh_iou(torch.Tensor(wh), torch.Tensor(k))
-        max_iou, min_iou = iou.max(1)[0], iou.min(1)[0]
+        iou = wh_iou(wh, torch.Tensor(k))
+        max_iou = iou.max(1)[0]
         bpr, aat = (max_iou > thr).float().mean(), (iou > thr).float().mean() * n  # best possible recall, anch > thr
         print('%.2f iou_thr: %.3f best possible recall, %.2f anchors > thr' % (thr, bpr, aat))
-        print('kmeans anchors (n=%g, img_size=%s, IoU=%.3f/%.3f/%.3f-min/mean/best): ' %
-              (n, img_size, min_iou.mean(), iou.mean(), max_iou.mean()), end='')
+        print('n=%g, img_size=%s, IoU_all=%.3f/%.3f-mean/best, IoU>thr=%.3f-mean: ' %
+              (n, img_size, iou.mean(), max_iou.mean(), iou[iou > thr].mean()), end='')
         for i, x in enumerate(k):
             print('%i,%i' % (round(x[0]), round(x[1])), end=',  ' if i < len(k) - 1 else '\n')  # use in *.cfg
         return k
 
-    def fitness(thr, wh, k):  # mutation fitness
-        iou = wh_iou(wh, torch.Tensor(k)).max(1)[0]  # max iou
-        bpr = (iou > thr).float().mean()  # best possible recall
-        return iou.mean() * bpr  # product
+    def fitness(k):  # mutation fitness
+        iou = wh_iou(wh, torch.Tensor(k))  # iou
+        max_iou = iou.max(1)[0]
+        return max_iou.mean()  # product
 
     # Get label wh
     wh = []
@@ -773,10 +776,11 @@ def kmean_anchors(path='../coco/train2017.txt', n=9, img_size=(320, 640)):
         wh.append(l[:, 3:5] * (s / s.max()))  # image normalized to letterbox normalized wh
     wh = np.concatenate(wh, 0).repeat(nr, axis=0)  # augment 10x
     wh *= np.random.uniform(img_size[0], img_size[1], size=(wh.shape[0], 1))  # normalized to pixels (multi-scale)
+    wh = wh[(wh > 2.0).all(1)]  # remove below threshold boxes (< 2 pixels wh)
 
     # Darknet yolov3.cfg anchors
     use_darknet = False
-    if use_darknet:
+    if use_darknet and n == 9:
         k = np.array([[10, 13], [16, 30], [33, 23], [30, 61], [62, 45], [59, 119], [116, 90], [156, 198], [373, 326]])
     else:
         # Kmeans calculation
@@ -785,7 +789,8 @@ def kmean_anchors(path='../coco/train2017.txt', n=9, img_size=(320, 640)):
         s = wh.std(0)  # sigmas for whitening
         k, dist = kmeans(wh / s, n, iter=30)  # points, mean distance
         k *= s
-    k = print_results(thr, wh, k)
+    wh = torch.Tensor(wh)
+    k = print_results(k)
 
     # # Plot
     # k, d = [None] * 20, [None] * 20
@@ -794,17 +799,25 @@ def kmean_anchors(path='../coco/train2017.txt', n=9, img_size=(320, 640)):
     # fig, ax = plt.subplots(1, 2, figsize=(14, 7))
     # ax = ax.ravel()
     # ax[0].plot(np.arange(1, 21), np.array(d) ** 2, marker='.')
+    # fig, ax = plt.subplots(1, 2, figsize=(14, 7))  # plot wh
+    # ax[0].hist(wh[wh[:, 0]<100, 0],400)
+    # ax[1].hist(wh[wh[:, 1]<100, 1],400)
+    # fig.tight_layout()
+    # fig.savefig('wh.png', dpi=200)
 
     # Evolve
-    wh = torch.Tensor(wh)
-    f, ng = fitness(thr, wh, k), 1000  # fitness, generations
+    npr = np.random
+    f, sh, ng, mp, s = fitness(k), k.shape, 1000, 0.9, 0.1  # fitness, generations, mutation prob, sigma
     for _ in tqdm(range(ng), desc='Evolving anchors'):
-        kg = (k.copy() * (1 + np.random.random() * np.random.randn(*k.shape) * 0.30)).clip(min=2.0)
-        fg = fitness(thr, wh, kg)
+        v = np.ones(sh)
+        while (v == 1).all():  # mutate until a change occurs (prevent duplicates)
+            v = ((npr.random(sh) < mp) * npr.random() * npr.randn(*sh) * s + 1).clip(0.3, 3.0)  # 98.6, 61.6
+        kg = (k.copy() * v).clip(min=2.0)
+        fg = fitness(kg)
         if fg > f:
             f, k = fg, kg.copy()
-            print_results(thr, wh, k)
-    k = print_results(thr, wh, k)
+            print_results(k)
+    k = print_results(k)
 
     return k
 
@@ -817,7 +830,7 @@ def print_mutation(hyp, results, bucket=''):
     print('\n%s\n%s\nEvolved fitness: %s\n' % (a, b, c))
 
     if bucket:
-        os.system('rm evolve.txt && gsutil cp gs://%s/evolve.txt .' % bucket)  # download evolve.txt
+        os.system('gsutil cp gs://%s/evolve.txt .' % bucket)  # download evolve.txt
 
     with open('evolve.txt', 'a') as f:  # append result
         f.write(c + b + '\n')
@@ -830,7 +843,7 @@ def print_mutation(hyp, results, bucket=''):
 
 def apply_classifier(x, model, img, im0):
     # applies a second stage classifier to yolo outputs
-
+    im0 = [im0] if isinstance(im0, np.ndarray) else im0
     for i, d in enumerate(x):  # per image
         if d is not None and len(d):
             d = d.clone()
@@ -865,7 +878,7 @@ def apply_classifier(x, model, img, im0):
 
 def fitness(x):
     # Returns fitness (for use with results.txt or evolve.txt)
-    w = [0.0, 0.0, 0.8, 0.2]  # weights for [P, R, mAP, F1]@0.5 or [P, R, mAP@0.5:0.95, mAP@0.5]
+    w = [0.0, 0.01, 0.99, 0.0]  # weights for [P, R, mAP, F1]@0.5 or [P, R, mAP@0.5:0.95, mAP@0.5]
     return (x[:, :4] * w).sum(1)
 
 
@@ -909,7 +922,7 @@ def plot_wh_methods():  # from utils.utils import *; plot_wh_methods()
     fig.savefig('comparison.png', dpi=200)
 
 
-def plot_images(imgs, targets, paths=None, fname='images.jpg'):
+def plot_images(imgs, targets, paths=None, fname='images.png'):
     # Plots training images overlaid with targets
     imgs = imgs.cpu().numpy()
     targets = targets.cpu().numpy()
@@ -945,13 +958,13 @@ def plot_test_txt():  # from utils.utils import *; plot_test()
     ax.hist2d(cx, cy, bins=600, cmax=10, cmin=0)
     ax.set_aspect('equal')
     fig.tight_layout()
-    plt.savefig('hist2d.jpg', dpi=300)
+    plt.savefig('hist2d.png', dpi=300)
 
     fig, ax = plt.subplots(1, 2, figsize=(12, 6))
     ax[0].hist(cx, bins=600)
     ax[1].hist(cy, bins=600)
     fig.tight_layout()
-    plt.savefig('hist1d.jpg', dpi=200)
+    plt.savefig('hist1d.png', dpi=200)
 
 
 def plot_targets_txt():  # from utils.utils import *; plot_targets_txt()
@@ -1020,6 +1033,7 @@ def plot_results(start=0, stop=0, bucket='', id=()):  # from utils.utils import 
     s = ['GIoU', 'Objectness', 'Classification', 'Precision', 'Recall',
          'val GIoU', 'val Objectness', 'val Classification', 'mAP@0.5', 'F1']
     if bucket:
+        os.system('rm -rf storage.googleapis.com')
         files = ['https://storage.googleapis.com/%s/results%g.txt' % (bucket, x) for x in id]
     else:
         files = glob.glob('results*.txt') + glob.glob('../../Downloads/results*.txt')
@@ -1031,6 +1045,7 @@ def plot_results(start=0, stop=0, bucket='', id=()):  # from utils.utils import 
             y = results[i, x]
             if i in [0, 1, 2, 5, 6, 7]:
                 y[y == 0] = np.nan  # dont show zero loss values
+                # y /= y[0]  # normalize
             ax[i].plot(x, y, marker='.', label=Path(f).stem)
             ax[i].set_title(s[i])
             if i in [5, 6, 7]:  # share train and val loss y axes

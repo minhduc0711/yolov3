@@ -5,8 +5,6 @@ import torch
 
 def init_seeds(seed=0):
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
     # Remove randomness (may be slower on Tesla GPUs) # https://pytorch.org/docs/stable/notes/randomness.html
     if seed == 0:
@@ -63,7 +61,7 @@ def fuse_conv_and_bn(conv, bn):
         else:
             b_conv = torch.zeros(conv.weight.size(0))
         b_bn = bn.bias - bn.weight.mul(bn.running_mean).div(torch.sqrt(bn.running_var + bn.eps))
-        fusedconv.bias.copy_(b_conv + b_bn)
+        fusedconv.bias.copy_(torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn)
 
         return fusedconv
 

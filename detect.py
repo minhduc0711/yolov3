@@ -25,7 +25,7 @@ def detect(save_img=False):
     if weights.endswith('.pt'):  # pytorch format
         model.load_state_dict(torch.load(weights, map_location=device)['model'])
     else:  # darknet format
-        _ = load_darknet_weights(model, weights)
+        load_darknet_weights(model, weights)
 
     # Second-stage classifier
     classify = False
@@ -36,12 +36,14 @@ def detect(save_img=False):
 
     # Fuse Conv2d + BatchNorm2d layers
     # model.fuse()
+    # torch_utils.model_info(model, report='summary')  # 'full' or 'summary'
 
     # Eval mode
     model.to(device).eval()
 
     # Export mode
     if ONNX_EXPORT:
+        model.fuse()
         img = torch.zeros((1, 3) + img_size)  # (1, 3, 320, 192)
         torch.onnx.export(model, img, 'weights/export.onnx', verbose=False, opset_version=10)
 
@@ -160,7 +162,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--cfg', type=str, default='cfg/yolov3-spp.cfg', help='*.cfg path')
     parser.add_argument('--names', type=str, default='data/coco.names', help='*.names path')
-    parser.add_argument('--weights', type=str, default='weights/yolov3-spp.weights', help='path to weights file')
+    parser.add_argument('--weights', type=str, default='weights/ultralytics68.pt', help='path to weights file')
     parser.add_argument('--source', type=str, default='data/samples', help='source')  # input file/folder, 0 for webcam
     parser.add_argument('--output', type=str, default='output', help='output folder')  # output folder
     parser.add_argument('--img-size', type=int, default=416, help='inference size (pixels)')
@@ -170,7 +172,7 @@ if __name__ == '__main__':
     parser.add_argument('--half', action='store_true', help='half precision FP16 inference')
     parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1) or cpu')
     parser.add_argument('--view-img', action='store_true', help='display results')
-    parser.add_argument('--save-txt', action='store_true', help='display results')
+    parser.add_argument('--save-txt', action='store_true', help='save results to *.txt')
     parser.add_argument('--classes', nargs='+', type=int, help='filter by class')
     parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
     opt = parser.parse_args()
