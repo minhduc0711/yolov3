@@ -1,8 +1,8 @@
 # Start FROM Nvidia PyTorch image https://ngc.nvidia.com/catalog/containers/nvidia:pytorch
-FROM nvcr.io/nvidia/pytorch:20.01-py3
+FROM nvcr.io/nvidia/pytorch:20.03-py3
 
 # Install dependencies (pip or conda)
-RUN pip install -U gsutil
+RUN pip install -U gsutil thop
 # RUN pip install -U -r requirements.txt
 # RUN conda update -n base -c defaults conda
 # RUN conda install -y -c anaconda future numpy opencv matplotlib tqdm pillow
@@ -47,10 +47,10 @@ COPY . /usr/src/app
 # t=ultralytics/yolov3:v0 && sudo docker build -t $t . && sudo docker push $t
 
 # Run
-# t=ultralytics/yolov3:v0 && sudo docker pull $t && sudo docker run -it $t
+# t=ultralytics/yolov3:v0 && sudo docker pull $t && sudo docker run -it --gpus all --ipc=host $t bash
 
 # Pull and Run with local directory access
-# t=ultralytics/yolov3:v0 && sudo docker pull $t && sudo docker run -it -v "$(pwd)"/coco:/usr/src/coco $t
+# t=ultralytics/yolov3:v0 && sudo docker pull $t && sudo docker run -it --gpus all --ipc=host -v "$(pwd)"/coco:/usr/src/coco $t bash
 
 # Kill all
 # sudo docker kill "$(sudo docker ps -q)"
