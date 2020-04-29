@@ -1,5 +1,0 @@
-classes= 5
-train = data/corn_train.txt
-valid = data/corn_test.txt
-names = data/corn.names
-backup = backup/
